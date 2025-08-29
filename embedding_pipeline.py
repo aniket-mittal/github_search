@@ -16,10 +16,12 @@ import json
 import time
 import logging
 import uuid
+import multiprocessing as mp
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
 import argparse
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 # Add src directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
@@ -97,25 +99,110 @@ class VoyageEmbedder:
         
         return None
     
-    def embed_batch(self, texts: List[str], batch_size: int = 100) -> List[Optional[List[float]]]:
-        """Embed a batch of texts with optimized batch size for Voyage API."""
+    def embed_batch(self, texts: List[str], batch_size: int = 100, parallel_workers: int = 4) -> List[Optional[List[float]]]:
+        """Embed a batch of texts with optimized batch size for Voyage API and parallel processing."""
         embeddings = []
         
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
             logger.info(f"Embedding batch {i//batch_size + 1}/{(len(texts) + batch_size - 1)//batch_size}")
             
-            batch_embeddings = []
-            for text in batch:
-                embedding = self.embed_text(text)
-                batch_embeddings.append(embedding)
+            # Use ThreadPoolExecutor for I/O-bound embedding tasks
+            # We limit workers to avoid overwhelming the API
+            with ThreadPoolExecutor(max_workers=min(parallel_workers, 4)) as executor:
+                # Submit all texts in this batch for parallel processing
+                future_to_index = {}
+                for j, text in enumerate(batch):
+                    future = executor.submit(self.embed_text, text)
+                    future_to_index[future] = j
                 
-                # Minimal delay to respect rate limits - Voyage can handle higher throughput
-                time.sleep(0.02)
+                batch_embeddings = [None] * len(batch)  # Preserve order
+                
+                for future in as_completed(future_to_index):
+                    try:
+                        embedding = future.result()
+                        original_index = future_to_index[future]
+                        batch_embeddings[original_index] = embedding
+                        
+                        # Small delay to respect rate limits
+                        time.sleep(0.01)
+                        
+                    except Exception as e:
+                        logger.error(f"Error in parallel embedding: {e}")
+                        original_index = future_to_index[future]
+                        batch_embeddings[original_index] = None
             
             embeddings.extend(batch_embeddings)
         
         return embeddings
+
+class ParallelChunker:
+    """Parallel chunking wrapper around ASTChunker."""
+    
+    def __init__(self, max_workers: int = None):
+        """Initialize parallel chunker."""
+        self.max_workers = max_workers or min(mp.cpu_count(), 8)  # Cap at 8 to avoid overwhelming
+        logger.info(f"Parallel chunker initialized with {self.max_workers} workers")
+    
+    @staticmethod
+    def chunk_file_static(file_path: str) -> List[CodeChunk]:
+        """Static method for chunking a single file - used by multiprocessing."""
+        try:
+            chunker = ASTChunker()
+            return chunker.chunk_file(file_path)
+        except Exception as e:
+            logger.warning(f"Error chunking {file_path}: {e}")
+            return []
+    
+    def chunk_directory_parallel(self, directory_path: str) -> List[CodeChunk]:
+        """Chunk a directory using parallel processing."""
+        directory = Path(directory_path)
+        if not directory.exists():
+            return []
+        
+        # Get all code files
+        code_files = []
+        for ext in ['.py', '.js', '.java', '.cpp', '.c', '.h', '.hpp', '.cs', '.php', '.rb', '.go', '.rs', '.swift', '.kt', '.scala']:
+            code_files.extend(directory.rglob(f'*{ext}'))
+        
+        # Also include common config files
+        config_files = []
+        for pattern in ['*.json', '*.xml', '*.yaml', '*.yml', '*.toml', '*.ini', '*.cfg', '*.conf', '*.sh', '*.bash', '*.zsh', '*.fish', '*.ps1', '*.bat', '*.cmd']:
+            config_files.extend(directory.rglob(pattern))
+        
+        all_files = list(code_files) + list(config_files)
+        
+        if not all_files:
+            logger.warning(f"No code files found in {directory_path}")
+            return []
+        
+        logger.info(f"Found {len(all_files)} files to chunk in parallel using {self.max_workers} workers")
+        
+        # Use multiprocessing for CPU-intensive chunking
+        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+            # Map files to chunking function
+            future_to_file = {executor.submit(self.chunk_file_static, str(f)): f for f in all_files}
+            
+            all_chunks = []
+            completed = 0
+            
+            for future in as_completed(future_to_file):
+                file_path = future_to_file[future]
+                try:
+                    chunks = future.result()
+                    if chunks:
+                        all_chunks.extend(chunks)
+                    completed += 1
+                    
+                    if completed % 100 == 0:
+                        logger.info(f"Chunked {completed}/{len(all_files)} files...")
+                        
+                except Exception as e:
+                    logger.error(f"Error processing {file_path}: {e}")
+                    completed += 1
+        
+        logger.info(f"Parallel chunking completed: {len(all_chunks)} total chunks from {len(all_files)} files")
+        return all_chunks
 
 class QdrantManager:
     """Manages Qdrant vector database operations."""
@@ -202,8 +289,6 @@ class QdrantManager:
                     )
                     logger.info(f"Inserted batch {i//batch_size + 1}: {len(points)} embeddings")
                 
-                # Minimal delay between batches
-                time.sleep(0.05)
             
             return True
             
@@ -238,9 +323,13 @@ class QdrantManager:
 class EmbeddingPipeline:
     """Main pipeline for chunking, embedding, and storing code."""
     
-    def __init__(self, test_mode: bool = False):
+    def __init__(self, test_mode: bool = False, resume: bool = False, max_batches: Optional[int] = None, random_sample: bool = True, parallel_workers: int = None):
         """Initialize the pipeline."""
         self.test_mode = test_mode
+        self.resume = resume
+        self.max_batches = max_batches
+        self.random_sample = random_sample
+        self.parallel_workers = parallel_workers or min(mp.cpu_count(), 8)
         
         # Get environment variables
         self.voyage_key = os.getenv('VOYAGE_KEY')
@@ -252,7 +341,7 @@ class EmbeddingPipeline:
             raise ValueError("VOYAGE_KEY environment variable not set")
         
         # Initialize components
-        self.chunker = ASTChunker()
+        self.chunker = ParallelChunker(max_workers=self.parallel_workers)
         self.embedder = VoyageEmbedder(self.voyage_key)
         
         # Only initialize Qdrant if not in test mode and Qdrant is properly configured
@@ -271,6 +360,63 @@ class EmbeddingPipeline:
         
         logger.info("Embedding pipeline initialized successfully")
     
+    def get_processed_repositories(self) -> set:
+        """Get list of repositories that have already been processed."""
+        if not self.qdrant:
+            return set()
+        
+        try:
+            # Get all unique file paths from the database using batch processing
+            processed_repos = set()
+            offset = None
+            batch_size = 10000
+            
+            while True:
+                # Get batch of points
+                if offset is None:
+                    result = self.qdrant.client.scroll(
+                        collection_name=self.qdrant.collection_name,
+                        limit=batch_size,
+                        with_payload=True
+                    )
+                else:
+                    result = self.qdrant.client.scroll(
+                        collection_name=self.qdrant.collection_name,
+                        limit=batch_size,
+                        offset=offset,
+                        with_payload=True
+                    )
+                
+                points, next_offset = result
+                
+                # Process this batch
+                for point in points:
+                    payload = point.payload
+                    if 'file_path' in payload:
+                        file_path = payload['file_path']
+                        if file_path.startswith('data/code_files/'):
+                            repo_name = file_path.split('/')[2]  # data/code_files/REPO_NAME/...
+                            processed_repos.add(repo_name)
+                
+                # Check if we've processed all points
+                if next_offset is None:
+                    break
+                
+                offset = next_offset
+                
+                # Safety check to prevent infinite loops
+                if len(processed_repos) > 100000:  # Sanity limit
+                    logger.warning("Reached safety limit while scanning processed repositories")
+                    break
+            
+            logger.info(f"Found {len(processed_repos)} already processed repositories in database")
+            return processed_repos
+            
+        except Exception as e:
+            logger.warning(f"Could not determine processed repositories: {e}")
+            # Fallback: return empty set to process all repositories
+            return set()
+    
     def process_repositories(self, repos_dir: str = "data/code_files", 
                            output_dir: str = "embeddings_output", 
                            limit: int = None) -> Dict[str, Any]:
@@ -283,14 +429,22 @@ class EmbeddingPipeline:
         os.makedirs(output_dir, exist_ok=True)
         
         # Get all repository directories
-        repos = [d for d in repos_dir.iterdir() if d.is_dir() and not d.name.startswith('.')]
+        all_repos = [d for d in repos_dir.iterdir() if d.is_dir() and not d.name.startswith('.')]
+        
+        # If resuming, filter out already processed repositories
+        if self.resume and not self.test_mode and self.qdrant:
+            processed_repos = self.get_processed_repositories()
+            repos_to_process = [d for d in all_repos if d.name not in processed_repos]
+            logger.info(f"Resume mode: {len(processed_repos)} already processed, {len(repos_to_process)} remaining")
+        else:
+            repos_to_process = all_repos
         
         # Apply limit if specified
         if limit:
-            repos = repos[:limit]
-            logger.info(f"Limited to {limit} repositories for testing")
+            repos_to_process = repos_to_process[:limit]
+            logger.info(f"Limited to {limit} repositories for processing")
         
-        logger.info(f"Found {len(repos)} repositories to process")
+        logger.info(f"Found {len(repos_to_process)} repositories to process (out of {len(all_repos)} total)")
         
         # Process each repository
         all_results = []
@@ -300,9 +454,9 @@ class EmbeddingPipeline:
         
         start_time = time.time()
         
-        for i, repo in enumerate(repos, 1):
+        for i, repo in enumerate(repos_to_process, 1):
             logger.info(f"\n{'='*60}")
-            logger.info(f"Processing repository {i}/{len(repos)}: {repo.name}")
+            logger.info(f"Processing repository {i}/{len(repos_to_process)}: {repo.name}")
             logger.info(f"{'='*60}")
             
             try:
@@ -330,13 +484,14 @@ class EmbeddingPipeline:
         # Final statistics
         total_time = time.time() - start_time
         stats = {
-            'total_repositories': len(repos),
+            'total_repositories': len(repos_to_process), # Use repos_to_process for stats
             'total_chunks': total_chunks,
             'total_embeddings': total_embeddings,
             'total_errors': total_errors,
             'total_time': total_time,
-            'avg_time_per_repo': total_time / len(repos) if repos else 0,
-            'success_rate': (total_embeddings / total_chunks * 100) if total_chunks > 0 else 0
+            'avg_time_per_repo': total_time / len(repos_to_process) if repos_to_process else 0,
+            'success_rate': (total_embeddings / total_chunks * 100) if total_chunks > 0 else 0,
+            'resume_mode': self.resume
         }
         
         # Save overall results
@@ -350,8 +505,8 @@ class EmbeddingPipeline:
         results = []
         
         try:
-            # Chunk the repository
-            chunks = self.chunker.chunk_directory(str(repo_path))
+            # Chunk the repository using parallel processing
+            chunks = self.chunker.chunk_directory_parallel(str(repo_path))
             logger.info(f"Generated {len(chunks)} chunks from {repo_path.name}")
             
             # Prepare texts for embedding
@@ -373,10 +528,32 @@ class EmbeddingPipeline:
                     'dependencies': chunk.dependencies
                 }
                 chunk_metadata.append(metadata)
+
+            # Optionally cap the number of batches per repository
+            batch_size = 100  # must stay in sync with embed_batch call below
+            if self.max_batches is not None and self.max_batches > 0:
+                max_chunks = self.max_batches * batch_size
+                if len(texts) > max_chunks:
+                    logger.info(
+                        f"Limiting processing to {self.max_batches} batches (" \
+                        f"{max_chunks} chunks) out of {len(texts)} total chunks"
+                    )
+                    # Choose indices to keep
+                    total_indices = list(range(len(texts)))
+                    if self.random_sample:
+                        import random
+                        chosen = random.sample(total_indices, max_chunks)
+                        chosen.sort()  # preserve increasing order for stability
+                    else:
+                        chosen = total_indices[:max_chunks]
+                    # Filter lists to chosen indices
+                    texts = [texts[i] for i in chosen]
+                    chunk_metadata = [chunk_metadata[i] for i in chosen]
+                    chunks = [chunks[i] for i in chosen]
             
             # Get embeddings
             logger.info(f"Getting embeddings for {len(texts)} chunks...")
-            embeddings = self.embedder.embed_batch(texts, batch_size=100)  # Optimized batch size
+            embeddings = self.embedder.embed_batch(texts, batch_size=batch_size, parallel_workers=4)  # Optimized batch size with parallel processing
             
             # Create results
             for i, (chunk, embedding, metadata) in enumerate(zip(chunks, embeddings, chunk_metadata)):
@@ -528,6 +705,10 @@ def main():
     parser.add_argument('--limit', type=int, default=None, help='Limit number of repositories to process')
     parser.add_argument('--repos-dir', default='data/code_files', help='Repository directory')
     parser.add_argument('--output-dir', default='embeddings_output', help='Output directory')
+    parser.add_argument('--resume', action='store_true', help='Resume processing from previously saved state')
+    parser.add_argument('--max-batches', type=int, default=None, help='Max embedding batches per repository (batch size = 100)')
+    parser.add_argument('--no-random-sample', action='store_true', help='Disable random sampling when limiting batches (take first N*batch)')
+    parser.add_argument('--parallel-workers', type=int, default=None, help='Number of parallel workers for chunking (default: min(CPU_count, 8))')
     
     args = parser.parse_args()
     
@@ -539,7 +720,13 @@ def main():
             return 0 if success else 1
         else:
             # Full pipeline
-            pipeline = EmbeddingPipeline(test_mode=False)
+            pipeline = EmbeddingPipeline(
+                test_mode=False,
+                resume=args.resume,
+                max_batches=args.max_batches,
+                random_sample=(not args.no_random_sample),
+                parallel_workers=args.parallel_workers
+            )
             stats = pipeline.process_repositories(args.repos_dir, args.output_dir, args.limit)
             
             logger.info("\n" + "="*60)
@@ -552,6 +739,10 @@ def main():
             logger.info(f"Success rate: {stats['success_rate']:.1f}%")
             logger.info(f"Total time: {stats['total_time']:.1f}s")
             logger.info(f"Average time per repo: {stats['avg_time_per_repo']:.1f}s")
+            logger.info(f"Resume mode: {stats['resume_mode']}")
+            logger.info(f"Parallel workers: {pipeline.parallel_workers}")
+            if args.max_batches:
+                logger.info(f"Per-repo batch cap: {args.max_batches} (batch size 100), random_sample={not args.no_random_sample}")
             
             return 0
             
