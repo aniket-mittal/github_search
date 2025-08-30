@@ -73,14 +73,28 @@ class CodeSearcher:
             raise Exception(f"Failed to initialize Voyage client: {e}")
     
     def _init_qdrant(self):
-        """Initialize Qdrant client."""
+        """Initialize Qdrant client with timeout configuration."""
         try:
             from qdrant_client import QdrantClient
+            from qdrant_client.http import models as rest
+            
+            # Initialize with timeout configuration
             self.qdrant_client = QdrantClient(
                 url=self.qdrant_url, 
                 port=self.qdrant_port, 
-                api_key=self.qdrant_key
+                api_key=self.qdrant_key,
+                timeout=60.0,  # 60 second timeout for operations
+                prefer_grpc=False  # Use HTTP for better timeout handling
             )
+            
+            # Test connection with a simple operation
+            try:
+                collections = self.qdrant_client.get_collections()
+                logger.info(f"Connected to Qdrant successfully. Found {len(collections.collections)} collections")
+            except Exception as conn_error:
+                logger.warning(f"Initial connection test failed: {conn_error}")
+                logger.info("Continuing with client initialization...")
+            
             logger.info("Qdrant client initialized successfully")
         except ImportError:
             raise ImportError("qdrant-client package not installed. Run: pip install qdrant-client")
@@ -102,97 +116,145 @@ class CodeSearcher:
             raise
     
     def search(self, query: str, limit: int = 10, score_threshold: float = 0.7) -> List[SearchResult]:
-        """Perform semantic search across the code database."""
-        try:
-            # Embed the query
-            logger.info(f"Embedding query: {query}")
-            query_vector = self.embed_query(query)
-            
-            # Search in Qdrant
-            logger.info("Searching in Qdrant...")
-            from qdrant_client.models import Filter, FieldCondition, MatchValue
-            
-            # Perform vector search
-            search_results = self.qdrant_client.search(
-                collection_name="code_chunks",
-                query_vector=query_vector,
-                limit=limit,
-                score_threshold=score_threshold,
-                with_payload=True
-            )
-            
-            # Convert to SearchResult objects
-            results = []
-            for result in search_results:
-                payload = result.payload
-                search_result = SearchResult(
-                    score=result.score,
-                    chunk_id=payload.get('chunk_id', ''),
-                    chunk_type=payload.get('chunk_type', ''),
-                    name=payload.get('name', ''),
-                    file_path=payload.get('file_path', ''),
-                    language=payload.get('language', ''),
-                    content=payload.get('content', ''),
-                    metadata=payload.get('metadata', {})
+        """Perform semantic search across the code database with retry logic."""
+        max_retries = 3
+        base_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                # Embed the query
+                logger.info(f"Embedding query: {query}")
+                query_vector = self.embed_query(query)
+                
+                # Search in Qdrant
+                logger.info(f"Searching in Qdrant (attempt {attempt + 1}/{max_retries})...")
+                from qdrant_client.models import Filter, FieldCondition, MatchValue
+                
+                # Perform vector search with timeout handling and performance optimizations
+                search_results = self.qdrant_client.search(
+                    collection_name="code_chunks",
+                    query_vector=query_vector,
+                    limit=limit,
+                    score_threshold=score_threshold,
+                    with_payload=True,
+                    timeout=120,  # Increased timeout for optimized search (2 minutes)
+                    search_params={
+                        "hnsw_ef": 128,        # Higher ef for better accuracy + speed
+                        "exact": False          # Approximate search for speed
+                    }
                 )
-                results.append(search_result)
-            
-            logger.info(f"Found {len(results)} results")
-            return results
-            
-        except Exception as e:
-            logger.error(f"Error during search: {e}")
-            raise
+                
+                # Convert to SearchResult objects
+                results = []
+                for result in search_results:
+                    payload = result.payload
+                    search_result = SearchResult(
+                        score=result.score,
+                        chunk_id=payload.get('chunk_id', ''),
+                        chunk_type=payload.get('chunk_type', ''),
+                        name=payload.get('name', ''),
+                        file_path=payload.get('file_path', ''),
+                        language=payload.get('language', ''),
+                        content=payload.get('content', ''),
+                        metadata=payload.get('metadata', {})
+                    )
+                    results.append(search_result)
+                
+                logger.info(f"Found {len(results)} results")
+                return results
+                
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "timeout" in error_msg or "timed out" in error_msg:
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)  # Exponential backoff
+                        logger.warning(f"Qdrant search timeout (attempt {attempt + 1}/{max_retries}). Retrying in {delay}s...")
+                        import time
+                        time.sleep(delay)
+                        continue
+                    else:
+                        logger.error(f"Qdrant search failed after {max_retries} attempts due to timeout")
+                        raise Exception(f"Search operation timed out after {max_retries} attempts. Please try again.")
+                else:
+                    logger.error(f"Error during search: {e}")
+                    raise
+        
+        # This should never be reached, but just in case
+        raise Exception("Search operation failed unexpectedly")
     
     def search_by_language(self, query: str, language: str, limit: int = 10, score_threshold: float = 0.7) -> List[SearchResult]:
-        """Search for code in a specific programming language."""
-        try:
-            # Embed the query
-            query_vector = self.embed_query(query)
-            
-            # Create filter for specific language
-            from qdrant_client.models import Filter, FieldCondition, MatchValue
-            
-            language_filter = Filter(
-                must=[
-                    FieldCondition(
-                        key="language",
-                        match=MatchValue(value=language)
-                    )
-                ]
-            )
-            
-            # Search with language filter
-            search_results = self.qdrant_client.search(
-                collection_name="code_chunks",
-                query_vector=query_vector,
-                query_filter=language_filter,
-                limit=limit,
-                score_threshold=score_threshold,
-                with_payload=True
-            )
-            
-            # Convert to SearchResult objects
-            results = []
-            for result in search_results:
-                payload = result.payload
-                search_result = SearchResult(
-                    score=result.score,
-                    chunk_id=payload.get('chunk_id', ''),
-                    chunk_type=payload.get('chunk_type', ''),
-                    name=payload.get('name', ''),
-                    file_path=payload.get('file_path', ''),
-                    language=payload.get('language', ''),
-                    content=payload.get('content', ''),
-                    metadata=payload.get('metadata', {})
+        """Search for code in a specific programming language with retry logic."""
+        max_retries = 3
+        base_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                # Embed the query
+                query_vector = self.embed_query(query)
+                
+                # Create filter for specific language
+                from qdrant_client.models import Filter, FieldCondition, MatchValue
+                
+                language_filter = Filter(
+                    must=[
+                        FieldCondition(
+                            key="language",
+                            match=MatchValue(value=language)
+                        )
+                    ]
                 )
-                results.append(search_result)
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Error during language-specific search: {e}")
-            raise
+                
+                # Search with language filter and timeout handling with performance optimizations
+                search_results = self.qdrant_client.search(
+                    collection_name="code_chunks",
+                    query_vector=query_vector,
+                    query_filter=language_filter,
+                    limit=limit,
+                    score_threshold=score_threshold,
+                    with_payload=True,
+                    timeout=120,  # Increased timeout for optimized search (2 minutes)
+                    search_params={
+                        "hnsw_ef": 128,        # Higher ef for better accuracy + speed
+                        "exact": False          # Approximate search for speed
+                    }
+                )
+                
+                # Convert to SearchResult objects
+                results = []
+                for result in search_results:
+                    payload = result.payload
+                    search_result = SearchResult(
+                        score=result.score,
+                        chunk_id=payload.get('chunk_id', ''),
+                        chunk_type=payload.get('chunk_type', ''),
+                        name=payload.get('name', ''),
+                        file_path=payload.get('file_path', ''),
+                        language=payload.get('language', ''),
+                        content=payload.get('content', ''),
+                        metadata=payload.get('metadata', {})
+                    )
+                    results.append(search_result)
+                
+                return results
+                
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "timeout" in error_msg or "timed out" in error_msg:
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)  # Exponential backoff
+                        logger.warning(f"Qdrant language search timeout (attempt {attempt + 1}/{max_retries}). Retrying in {delay}s...")
+                        import time
+                        time.sleep(delay)
+                        continue
+                    else:
+                        logger.error(f"Qdrant language search failed after {max_retries} attempts due to timeout")
+                        raise Exception(f"Language search operation timed out after {max_retries} attempts. Please try again.")
+                else:
+                    logger.error(f"Error during language-specific search: {e}")
+                    raise
+        
+        # This should never be reached, but just in case
+        raise Exception("Language search operation failed unexpectedly")
     
     def get_database_stats(self) -> Dict[str, Any]:
         """Get statistics about the code database."""
@@ -206,6 +268,28 @@ class CodeSearcher:
         except Exception as e:
             logger.error(f"Error getting database stats: {e}")
             return {}
+    
+    def health_check(self) -> Dict[str, Any]:
+        """Check the health of the Qdrant connection."""
+        try:
+            # Test basic connectivity
+            collections = self.qdrant_client.get_collections()
+            
+            # Test collection access
+            collection_info = self.qdrant_client.get_collection("code_chunks")
+            
+            return {
+                'status': 'healthy',
+                'collections_count': len(collections.collections),
+                'code_chunks_points': collection_info.points_count,
+                'connection_url': f"{self.qdrant_url}:{self.qdrant_port}"
+            }
+        except Exception as e:
+            return {
+                'status': 'unhealthy',
+                'error': str(e),
+                'connection_url': f"{self.qdrant_url}:{self.qdrant_port}"
+            }
 
 def main():
     """Main function for command-line usage."""

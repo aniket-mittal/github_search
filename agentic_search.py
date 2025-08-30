@@ -350,7 +350,8 @@ Generate focused search queries that will help find the most relevant code snipp
             result.source_queries = chunk_to_queries.get(result.chunk_id, [])
             sorted_results.append(result)
         
-        return sorted_results[:limit]
+        # Return all results above threshold (no limit applied here)
+        return sorted_results
     
     def search(self, query: str, limit: int = 10, score_threshold: float = 0.7) -> AgenticSearchResult:
         """
@@ -410,8 +411,8 @@ Generate focused search queries that will help find the most relevant code snipp
                 search_query = query_info["query"]
                 logger.info(f"Searching with query: {search_query}")
                 
-                # Perform the search
-                results = self.code_searcher.search(search_query, limit * 2, score_threshold)
+                # Perform the search with higher limit to get more results above threshold
+                results = self.code_searcher.search(search_query, limit * 10, score_threshold)
                 
                 # Store results for this query
                 query_results.append({
@@ -474,8 +475,8 @@ Generate focused search queries that will help find the most relevant code snipp
                 search_query = query_info["query"]
                 logger.info(f"Searching with query: {search_query}")
                 
-                # Perform the search WITHOUT language filter to get all results
-                results = self.code_searcher.search(search_query, limit * 3, score_threshold)
+                # Perform the search WITHOUT language filter to get more results above threshold
+                results = self.code_searcher.search(search_query, limit * 10, score_threshold)
                 
                 # Filter results by language on the client side (case-insensitive and handle variations)
                 def normalize_language(lang):
@@ -524,6 +525,17 @@ Generate focused search queries that will help find the most relevant code snipp
             combined_results=combined_results,
             total_results=len(combined_results)
         )
+    
+    def health_check(self) -> Dict[str, Any]:
+        """Check the health of the underlying code searcher."""
+        try:
+            return self.code_searcher.health_check()
+        except Exception as e:
+            return {
+                'status': 'unhealthy',
+                'error': str(e),
+                'component': 'agentic_searcher'
+            }
     
     def search_by_language(self, query: str, language: str, limit: int = 10, score_threshold: float = 0.7) -> AgenticSearchResult:
         """

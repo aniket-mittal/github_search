@@ -227,6 +227,17 @@
             font-size: 0.8rem;
             margin-left: 8px;
         }
+
+        .searching-status {
+            color: #667eea !important;
+            font-weight: 600;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
         
         .query-meta {
             display: flex;
@@ -370,6 +381,63 @@
 
         .source-query:last-child {
             margin-bottom: 0;
+        }
+
+        .clickable-query {
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .clickable-query:hover {
+            background: #1976d2 !important;
+            color: white !important;
+            transform: translateY(-1px);
+            box-shadow: 0 2px 8px rgba(25, 118, 210, 0.3);
+        }
+
+        .pagination-controls {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 10px;
+            margin-top: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            border: 1px solid #e9ecef;
+        }
+
+        .pagination-btn, .page-number {
+            padding: 8px 16px;
+            border: 2px solid #e9ecef;
+            background: white;
+            color: #495057;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            font-weight: 500;
+        }
+
+        .pagination-btn:hover, .page-number:hover {
+            border-color: #667eea;
+            color: #667eea;
+            transform: translateY(-1px);
+        }
+
+        .page-number.current {
+            background: #667eea;
+            color: white;
+            border-color: #667eea;
+            cursor: default;
+        }
+
+        .page-number.current:hover {
+            transform: none;
+        }
+
+        .page-numbers {
+            display: flex;
+            gap: 5px;
         }
 
         .frequency-badge {
@@ -612,6 +680,13 @@
     </div>
 
     <script>
+        // Global variables to store search state
+        let allSearchResults = [];
+        let currentQuery = '';
+        let currentLanguage = '';
+        let currentScoreThreshold = 0.7;
+        let currentPageSize = 10;
+        
         document.getElementById('searchForm').addEventListener('submit', async function(e) {
             e.preventDefault();
             
@@ -631,48 +706,41 @@
             // Get form data
             const formData = {
                 query: document.getElementById('query').value,
-                limit: parseInt(document.getElementById('limit').value),
+                page: 1, // Start with first page
+                page_size: parseInt(document.getElementById('limit').value),
                 score_threshold: parseFloat(document.getElementById('score_threshold').value),
                 language: document.getElementById('language').value
             };
             
+            // Store current search parameters
+            currentQuery = formData.query;
+            currentLanguage = formData.language;
+            currentScoreThreshold = formData.score_threshold;
+            currentPageSize = formData.page_size;
+            
             try {
-                // Step 1: Generate queries first (for immediate display)
-                const queriesResponse = await fetch('/generate_queries', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ 
-                        query: formData.query,
-                        language: formData.language 
-                    })
-                });
+                // Step 1: Show initial loading state
+                document.querySelector('#loadingSection p').textContent = '🤖 AI is analyzing your query and generating search strategies...';
                 
-                const queriesData = await queriesResponse.json();
+                // Step 2: Generate queries first
+                const queriesData = await generateQueries(formData.query, formData.language);
                 
-                if (queriesResponse.ok && queriesData.success) {
-                    // Show queries immediately
-                    displayQueries(queriesData);
+                if (queriesData.success) {
+                    // Step 3: Show queries immediately with "Searching..." status
+                    displayQueriesWithSearchingStatus(queriesData);
                     
-                    // Update loading message to show searches are happening
+                    // Step 4: Update loading message
                     document.querySelector('#loadingSection p').textContent = '🔍 Searching with generated queries...';
                     
-                    // Step 2: Perform the actual search
-                    const searchResponse = await fetch('/search', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify(formData)
-                    });
+                    // Step 5: Perform the actual search with generated queries
+                    const searchData = await searchWithGeneratedQueries(formData.query, queriesData.generated_queries, formData.page, formData.page_size, formData.score_threshold);
                     
-                    const searchData = await searchResponse.json();
-                    
-                    if (searchResponse.ok && searchData.success) {
-                        // Update queries with result counts
+                    if (searchData.success) {
+                        // Step 6: Store all results in memory for pagination
+                        allSearchResults = searchData.all_results || searchData.results;
+                        
+                        // Step 7: Update queries with actual result counts and show results
                         updateQueriesWithResults(searchData);
-                        // Show results
                         displayResults(searchData);
                     } else {
                         throw new Error(searchData.error || 'Search failed');
@@ -690,24 +758,89 @@
             }
         });
         
-        function showQueriesLoading() {
-            const queriesLoadingContainer = document.getElementById('queriesLoadingContainer');
-            const queriesLoadingList = document.getElementById('queriesLoadingList');
-            
-            if (queriesLoadingContainer && queriesLoadingList) {
-                queriesLoadingContainer.style.display = 'block';
+        async function generateQueries(query, language) {
+            try {
+                const response = await fetch('/generate_queries', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        query: query,
+                        language: language
+                    })
+                });
                 
-                // Show a loading message for queries
-                queriesLoadingList.innerHTML = `
-                    <div class="query-item">
-                        <span class="query-text">Generating search queries...</span>
-                        <span class="query-priority medium">AI</span>
-                    </div>
-                `;
+                const data = await response.json();
+                
+                if (response.ok && data.success) {
+                    return data;
+                } else {
+                    throw new Error(data.error || 'Query generation failed');
+                }
+            } catch (error) {
+                throw new Error('Failed to generate queries: ' + error.message);
             }
         }
         
-        function displayQueries(data) {
+        async function searchWithGeneratedQueries(query, generatedQueries, page, pageSize, scoreThreshold) {
+            try {
+                const response = await fetch('/search_with_queries', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        query: query,
+                        generated_queries: generatedQueries,
+                        page: page,
+                        page_size: pageSize,
+                        score_threshold: scoreThreshold
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok && data.success) {
+                    return data;
+                } else {
+                    throw new Error(data.error || 'Search failed');
+                }
+            } catch (error) {
+                throw new Error('Search failed: ' + error.message);
+            }
+        }
+        
+        async function performSearch(query, page, pageSize, scoreThreshold, language) {
+            try {
+                const searchResponse = await fetch('/search', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        query: query,
+                        page: page,
+                        page_size: pageSize,
+                        score_threshold: scoreThreshold,
+                        language: language
+                    })
+                });
+                
+                const searchData = await searchResponse.json();
+                
+                if (searchResponse.ok && searchData.success) {
+                    return searchData;
+                } else {
+                    throw new Error(searchData.error || 'Search failed');
+                }
+            } catch (error) {
+                displayError(error.message);
+                return { success: false, error: error.message };
+            }
+        }
+        
+        function displayQueriesWithSearchingStatus(data) {
             const queriesSection = document.getElementById('queriesSection');
             const queriesContainer = document.getElementById('queriesContainer');
             const queriesCount = document.getElementById('queriesCount');
@@ -729,7 +862,7 @@
                             <span class="query-priority ${queryInfo.priority}">${queryInfo.priority}</span>
                             ${queryInfo.languages ? `<span class="query-languages">${formatLanguages(queryInfo.languages)}</span>` : ''}
                         </div>
-                        <span class="query-results-count">Searching...</span>
+                        <span class="query-results-count searching-status">Searching...</span>
                     </div>
                 `).join('');
             }
@@ -760,7 +893,7 @@
             const resultsContainer = document.getElementById('resultsContainer');
             const resultsCount = document.getElementById('resultsCount');
             
-            resultsCount.textContent = `Found ${data.total_results} combined results for "${data.original_query}"`;
+            resultsCount.textContent = `Found ${data.total_results} combined results for "${data.original_query}" (Page ${data.pagination?.current_page || 1} of ${data.pagination?.total_pages || 1})`;
             
             if (data.results.length === 0) {
                 resultsContainer.innerHTML = `
@@ -794,7 +927,7 @@
                                 <div class="meta-label">Found by Query</div>
                                 ${result.source_queries && result.source_queries.length > 0 ? 
                                     result.source_queries.map(query => `
-                                        <div class="meta-value source-query">${escapeHtml(query)}</div>
+                                        <div class="meta-value source-query clickable-query" onclick="filterByQuery('${escapeHtml(query)}')">${escapeHtml(query)}</div>
                                     `).join('') : 
                                     `<div class="meta-value source-query">${escapeHtml(result.source_query || 'Unknown')}</div>`
                                 }
@@ -804,6 +937,12 @@
                         <div class="result-content">${escapeHtml(result.content)}</div>
                     </div>
                 `).join('');
+                
+                // Add pagination controls
+                if (data.pagination && data.pagination.total_pages > 1) {
+                    const paginationHtml = createPaginationControls(data.pagination, data.original_query);
+                    resultsContainer.insertAdjacentHTML('beforeend', paginationHtml);
+                }
             }
             
             resultsSection.style.display = 'block';
@@ -845,6 +984,79 @@
             }
             
             return '';
+        }
+        
+        function createPaginationControls(pagination, originalQuery) {
+            const { current_page, total_pages, has_next, has_prev } = pagination;
+            
+            let controls = '<div class="pagination-controls">';
+            
+            // Previous button
+            if (has_prev) {
+                controls += `<button class="pagination-btn prev-btn" onclick="changePage(${current_page - 1})">← Previous</button>`;
+            }
+            
+            // Page numbers
+            controls += '<div class="page-numbers">';
+            for (let i = Math.max(1, current_page - 2); i <= Math.min(total_pages, current_page + 2); i++) {
+                if (i === current_page) {
+                    controls += `<span class="page-number current">${i}</span>`;
+                } else {
+                    controls += `<button class="page-number" onclick="changePage(${i})">${i}</button>`;
+                }
+            }
+            controls += '</div>';
+            
+            // Next button
+            if (has_next) {
+                controls += `<button class="page-number" onclick="changePage(${current_page + 1})">Next →</button>`;
+            }
+            
+            controls += '</div>';
+            return controls;
+        }
+        
+        function changePage(page) {
+            // Client-side pagination - no need to make new API calls
+            if (allSearchResults.length === 0) {
+                displayError('No search results available for pagination');
+                return;
+            }
+            
+            const startIdx = (page - 1) * currentPageSize;
+            const endIdx = startIdx + currentPageSize;
+            const pageResults = allSearchResults.slice(startIdx, endIdx);
+            
+            const totalPages = Math.ceil(allSearchResults.length / currentPageSize);
+            
+            // Create pagination data structure
+            const paginationData = {
+                success: true,
+                original_query: currentQuery,
+                results: pageResults,
+                total_results: allSearchResults.length,
+                pagination: {
+                    current_page: page,
+                    page_size: currentPageSize,
+                    total_pages: totalPages,
+                    has_next: page < totalPages,
+                    has_prev: page > 1
+                }
+            };
+            
+            // Display the page results
+            displayResults(paginationData);
+            
+            // Scroll to top of results
+            document.getElementById('resultsSection').scrollIntoView({ behavior: 'smooth' });
+        }
+        
+        async function filterByQuery(queryText) {
+            // Update the search input
+            document.getElementById('query').value = queryText;
+            
+            // Trigger a new search with the filtered query
+            document.getElementById('searchForm').dispatchEvent(new Event('submit'));
         }
         
         // Update stats periodically
