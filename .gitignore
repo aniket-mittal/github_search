@@ -1,0 +1,15 @@
+/data
+/docs
+.env
+.excellent-setup-470020-s3.json
+.DS_Store
+*.json
+test*
+/embeddings_output
+embedding_pipeline.log
+chunk_summary.py
+upload.log
+__pycache__
+.venv
+*.lock
+*.egg-info
