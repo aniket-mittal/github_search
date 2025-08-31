@@ -1,0 +1,13 @@
+[project]
+name = "shook"
+version = "0.1.0"
+description = "Adding numbers"
+requires-python = ">=3.10"
+dependencies = ["mcp"]
+
+[project.scripts]
+shook-mcp = "main:main"
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
