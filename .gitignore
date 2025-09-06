@@ -1,0 +1,14 @@
+/data
+/docs
+.env
+.excellent-setup-470020-s3.json
+.DS_Store
+*.json
+*.md
+test*
+/embeddings_output
+embedding_pipeline.log
+chunk_summary.py
+upload.log
+__pycache__/
+

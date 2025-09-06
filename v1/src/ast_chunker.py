@@ -26,16 +26,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class ChunkType(Enum):
-    """Types of code chunks."""
-    CLASS = "class"
-    FUNCTION = "function"
-    MODULE = "module"
-    IMPORT = "import"
-    VARIABLE = "variable"
-    COMMENT = "comment"
-    STRING = "string"
-    MISC = "misc"
 
 @dataclass
 class CodeChunk:
